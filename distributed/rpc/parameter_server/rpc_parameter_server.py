@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 from torch.distributed.optim import DistributedOptimizer
+import torch.distributed as dist
 from torchvision import datasets, transforms
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -22,6 +23,33 @@ logger = logging.getLogger()
 TRAINER_LOG_INTERVAL = 5  # How frequently to log information
 TERMINATE_AT_ITER = 300  # for early stopping when debugging
 PS_AVERAGE_EVERY_N = 25  # How often to average models between trainers
+
+
+NUM_TRAINERS_WAITED = 0
+num_trainers_waited_lock = Lock()
+
+def trainer_arrived():
+    with num_trainers_waited_lock:
+        global NUM_TRAINERS_WAITED
+        NUM_TRAINERS_WAITED += 1
+
+def wait_all_trainers(rank, world_size):
+    global NUM_TRAINERS_WAITED
+    # Send RPC to all other trainers (non-zero ranks)
+    for i in range(world_size):
+        if i != rank and i != 0:
+            rpc.rpc_sync(f"trainer_{i}", trainer_arrived, args=())
+    # Wait for all trainers to arrive
+    with num_trainers_waited_lock:
+        cur_num_trainers = NUM_TRAINERS_WAITED
+
+    if cur_num_trainers != world_size - 1:
+        time.sleep(0.01)
+        with num_trainers_waited_lock:
+            cur_num_trainers = NUM_TRAINERS_WAITED
+
+
+
 
 # --------- MNIST Network to train, from pytorch/examples -----
 
@@ -72,16 +100,13 @@ class ParameterServer(nn.Module):
     def __init__(self, num_gpus=0):
         super().__init__()
         self.num_gpus = num_gpus
-        self.models = {}
-        # This lock is only used during init, and does not
-        # impact training perf.
-        self.models_init_lock = Lock()
+        self.model = Net(num_gpus=num_gpus)
         self.input_device = torch.device(
             "cuda:0" if torch.cuda.is_available() and num_gpus > 0 else "cpu")
 
     def forward(self, rank, inp):
         inp = inp.to(self.input_device)
-        out = self.models[rank](inp)
+        out = self.model(inp)
         # This output is forwarded over RPC, which as of 1.5.0 only accepts CPU tensors.
         # Tensors must be moved in and out of GPU memory due to this.
         out = out.to("cpu")
@@ -103,28 +128,28 @@ class ParameterServer(nn.Module):
     # DistributedOptimizer which optimizes parameters remotely.
     def get_param_rrefs(self, rank):
         param_rrefs = [rpc.RRef(param)
-                       for param in self.models[rank].parameters()]
+                       for param in self.model.parameters()]
         return param_rrefs
 
-    def create_model_for_rank(self, rank, num_gpus):
-        assert num_gpus == self.num_gpus, f"Inconsistent no. of GPUs requested from rank vs initialized with on PS: {num_gpus} vs {self.num_gpus}"
-        with self.models_init_lock:
-            if rank not in self.models:
-                self.models[rank] = Net(num_gpus=num_gpus)
+    # def create_model_for_rank(self, rank, num_gpus):
+    #     assert num_gpus == self.num_gpus, f"Inconsistent no. of GPUs requested from rank vs initialized with on PS: {num_gpus} vs {self.num_gpus}"
+    #     with self.models_init_lock:
+    #         if rank not in self.models:
+    #             self.models[0] = Net(num_gpus=num_gpus)
 
-    def get_num_models(self):
-        with self.models_init_lock:
-            return len(self.models)
+    # def get_num_models(self):
+    #     with self.models_init_lock:
+    #         return len(self.models)
 
-    def average_models(self, rank):
-        # Load state dict of requested rank
-        state_dict_for_rank = self.models[rank].state_dict()
-        # Average all params
-        for key in state_dict_for_rank:
-            state_dict_for_rank[key] = sum(self.models[r].state_dict()[
-                                           key] for r in self.models) / len(self.models)
-        # Rewrite back state dict
-        self.models[rank].load_state_dict(state_dict_for_rank)
+    # def average_models(self, rank):
+    #     # Load state dict of requested rank
+    #     state_dict_for_rank = self.models[0].state_dict()
+    #     # Average all params
+    #     for key in state_dict_for_rank:
+    #         state_dict_for_rank[key] = sum(self.models[0].state_dict()[
+    #                                        key] for r in self.models) / len(self.models)
+    #     # Rewrite back state dict
+    #     self.models[0].load_state_dict(state_dict_for_rank)
 
 
 param_server = None
@@ -139,7 +164,7 @@ def get_parameter_server(rank, num_gpus=0):
             # construct it once
             param_server = ParameterServer(num_gpus=num_gpus)
         # Add model for this rank
-        param_server.create_model_for_rank(rank, num_gpus)
+        # param_server.create_model_for_rank(rank, num_gpus)
         return param_server
 
 
@@ -178,8 +203,8 @@ class TrainerNet(nn.Module):
         model_output = self.param_server_rref.rpc_sync().forward(self.rank, x)
         return model_output
 
-    def average_model_across_trainers(self):
-        self.param_server_rref.rpc_sync().average_models(self.rank)
+    # def average_model_across_trainers(self):
+    #     self.param_server_rref.rpc_sync().average_models(self.rank)
 
 
 def run_training_loop(rank, world_size, num_gpus, train_loader, test_loader):
@@ -188,10 +213,10 @@ def run_training_loop(rank, world_size, num_gpus, train_loader, test_loader):
     net = TrainerNet(rank=rank, num_gpus=num_gpus)
     # Wait for all nets on PS to be created, otherwise we could run
     # into race conditions during training.
-    num_created = net.param_server_rref.rpc_sync().get_num_models()
-    while num_created != world_size - 1:
-        time.sleep(0.5)
-        num_created = net.param_server_rref.rpc_sync().get_num_models()
+    # num_created = net.param_server_rref.rpc_sync().get_num_models()
+    # while num_created != world_size - 1:
+    #     time.sleep(0.5)
+    #     num_created = net.param_server_rref.rpc_sync().get_num_models()
 
     # Build DistributedOptimizer.
     param_rrefs = net.get_global_param_rrefs()
@@ -203,7 +228,7 @@ def run_training_loop(rank, world_size, num_gpus, train_loader, test_loader):
             # Request server to update model with average params across all
             # trainers.
             logger.info(f"Rank {rank} averaging model across all trainers.")
-            net.average_model_across_trainers()
+#            net.average_model_across_trainers()
         with dist_autograd.context() as cid:
             model_output = net(data)
             target = target.to(model_output.device)
@@ -211,10 +236,12 @@ def run_training_loop(rank, world_size, num_gpus, train_loader, test_loader):
             if i % TRAINER_LOG_INTERVAL == 0:
                 logger.info(f"Rank {rank} training batch {i} loss {loss.item()}")
             dist_autograd.backward(cid, [loss])
+            wait_all_trainers(rank=rank, world_size=world_size)
             # Ensure that dist autograd ran successfully and gradients were
             # returned.
             assert net.param_server_rref.rpc_sync().get_dist_gradients(cid) != {}
             opt.step(cid)
+            wait_all_trainers(rank=rank, world_size=world_size)
 
     logger.info("Training complete!")
     logger.info("Getting accuracy....")
